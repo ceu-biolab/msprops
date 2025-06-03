@@ -1,0 +1,6 @@
+numpy
+pyteomics
+matchms
+pyopenms
+pymzml
+lxml
