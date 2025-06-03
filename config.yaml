@@ -1,0 +1,28 @@
+precursor_mz: 351.2177124023439
+mz_tol_ppm: 10
+# mz_tol_da: 0.01
+rt_window: [0.0, 10000000000.0]
+charge: 1
+# Ordered list of filters (see FILTER_REGISTRY below). Each item can be either
+#   • a string (filter name, uses default parameters) or
+#   • a mapping with keys {name: <str>, args: {<param>: <value>, ...}}
+filters:
+  # - default_filters
+  - {name: select_by_mz, args: {mz_from: 50, mz_to: 1500}}
+  - {name: select_by_relative_intensity, args: {intensity_from: 0.01}}
+  - openms_deisotope
+  - remove_peaks_around_precursor_mz
+  - {name: reduce_to_number_of_peaks, args: {n_max: 150}}
+  - {name: require_minimum_number_of_peaks, args: {n_required: 5}}
+
+
+merge:
+  mz_bin_da: 0.01
+  method: simple      # weighted or simple
+  rt_prec_tolerance_s: 100000   # Only relevant for weighted method
+
+
+consolidate:           # Step 4
+  min_relative_intensity: 0.005   # drop peaks <0.5 % base
+  top_n: 50                       # keep N most intense (null = off)
+  intensity_norm: 1000            # tallest peak after scaling
