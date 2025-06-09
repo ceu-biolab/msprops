@@ -1,4 +1,4 @@
-precursor_mz: 351.2177124023439
+# precursor_mz: 293.2121
 mz_tol_ppm: 10
 # mz_tol_da: 0.01
 rt_window: [0.0, 10000000000.0]

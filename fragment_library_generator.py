@@ -335,42 +335,50 @@ def consolidate_spectrum(spec: Spectrum, cfg: dict) -> Spectrum:
     return spec
 
 
-def extract_and_clean(mzml_path: Path, expected_charge: Optional[int], cfg: dict, output_path: Path):
-    """Select scans, clean them, and export cleaned spectra."""
-
-    target_mz = cfg["precursor_mz"]
-    mz_tol_ppm = cfg["mz_tol_ppm"]
-    rt_start, rt_end = cfg["rt_window"]
-
-    processor = build_processor(cfg.get("filters", []))
-
-    logging.info("Precursor %.6f ± %.1f ppm | RT %.1f-%.1f s", target_mz, mz_tol_ppm, rt_start, rt_end)
-
+def extract_ms2_spectra_from_mzml(mzml_path: Path, processor, target_mz=None, mz_tol_ppm=None, rt_window=None, expected_charge=None):
+    """
+    Extract MS2 spectra from an mzML file.
+    
+    If target_mz is specified, only extracts spectra matching that precursor m/z.
+    Otherwise, extracts all MS2 spectra.
+    
+    Returns a dictionary mapping precursor m/z (rounded to 4 decimals) to a list of spectra.
+    """
     reader = pymzml.run.Reader(
         mzml_path,
         extraAccessions=["MS:1000744"],  # selected ion m/z
     )
-
-    spectra_out: List[Spectrum] = []
-
+    
+    spectra_by_precursor = {}
+    
     for scan in reader:
         if scan.ms_level != 2:
             continue
         if not scan.selected_precursors:
             continue
+            
         try:
             prec_mz = scan.selected_precursors[0]["mz"] if scan.selected_precursors else scan["precursorMz"]
         except Exception:
             logging.warning("No precursor m/z found in scan %s", scan.ID)
             continue
+            
+        # Check if we're filtering by expected charge
         if expected_charge is not None and scan.selected_precursors[0].get("charge") != expected_charge:
-            logging.warning("Scan %s has unexpected charge %s (expected %d)", scan.ID, scan.selected_precursors[0].get("charge"), expected_charge)
+            logging.warning("Scan %s has unexpected charge %s (expected %d)", 
+                           scan.ID, scan.selected_precursors[0].get("charge"), expected_charge)
             continue
-        if ppm_diff(prec_mz, target_mz, target_mz) > mz_tol_ppm:
-            continue
+            
+        # Check if we're filtering by target m/z
+        if target_mz is not None and mz_tol_ppm is not None:
+            if ppm_diff(prec_mz, target_mz, target_mz) > mz_tol_ppm:
+                continue
+                
+        # Check RT window if specified
         rt = scan.scan_time_in_minutes() * 60.0
-        if not (rt_start <= rt <= rt_end):
+        if rt_window is not None and not (rt_window[0] <= rt <= rt_window[1]):
             continue
+            
         spec = Spectrum(
             mz=scan.mz,
             intensities=scan.i,
@@ -383,49 +391,156 @@ def extract_and_clean(mzml_path: Path, expected_charge: Optional[int], cfg: dict
                 "collision_energy": scan.selected_precursors[0].get("collisionEnergy"),
             },
         )
+        
         spec = processor(spec)
         if spec is not None and len(spec.peaks.mz) >= 3:
-            spectra_out.append(spec)
+            # Round to 4 decimal places to group similar precursors
+            prec_key = round(prec_mz, 4)
+            if prec_key not in spectra_by_precursor:
+                spectra_by_precursor[prec_key] = []
+            spectra_by_precursor[prec_key].append(spec)
+            
+    return spectra_by_precursor
 
-    out_list: List[Spectrum] = spectra_out
+def extract_ms2_spectra_from_multiple_mzml(mzml_paths: List[Path], processor, target_mz=None, mz_tol_ppm=None, rt_window=None, expected_charge=None):
+    """
+    Extract MS2 spectra from multiple mzML files and combine the results.
+    
+    Returns a dictionary mapping precursor m/z (rounded to 4 decimals) to a list of spectra.
+    """
+    spectra_by_precursor = {}
+    
+    for mzml_path in mzml_paths:
+        logging.info("Extracting spectra from %s", mzml_path)
+        file_spectra = extract_ms2_spectra_from_mzml(
+            mzml_path, processor, target_mz, mz_tol_ppm, rt_window, expected_charge
+        )
+        
+        # Merge the spectra dictionaries
+        for prec_mz, spectra in file_spectra.items():
+            if prec_mz not in spectra_by_precursor:
+                spectra_by_precursor[prec_mz] = []
+            spectra_by_precursor[prec_mz].extend(spectra)
+    
+    # Log some statistics
+    total_spectra = sum(len(spectra) for spectra in spectra_by_precursor.values())
+    logging.info("Extracted %d total spectra across %d precursors from %d files", 
+                 total_spectra, len(spectra_by_precursor), len(mzml_paths))
+    
+    return spectra_by_precursor
+
+def process_precursor_spectra(spectra: List[Spectrum], precursor_mz: float, cfg: dict, mzml_paths: Union[Path, List[Path]]) -> Optional[Spectrum]:
+    """Process all spectra for a given precursor m/z into a single consensus spectrum."""
+    if not spectra:
+        return None
+        
+    # Create a copy of the config with this specific precursor m/z
+    prec_cfg = dict(cfg)
+    prec_cfg["precursor_mz"] = precursor_mz
+    
+    # Merge spectra for this precursor
     if cfg.get("merge", {}).get("method") == "weighted":
-        consensus = merge_spectra(spectra_out, cfg)
+        consensus = merge_spectra(spectra, prec_cfg)
     elif cfg.get("merge", {}).get("method") in ["simple", "apex"]:
-        consensus = merge_spectra_apex(spectra_out, cfg)
+        consensus = merge_spectra_apex(spectra, prec_cfg)
     else:
         logging.warning("No valid merge method specified, using 'simple' as default")
-        consensus = merge_spectra_apex(spectra_out, cfg)
-
-    consensus = consolidate_spectrum(consensus, cfg)
+        consensus = merge_spectra_apex(spectra, prec_cfg)
+    
+    consensus = consolidate_spectrum(consensus, prec_cfg)
     if consensus is not None:
         # Add some extra metadata
-        # Ionization mode, charge mode, etc
-        # > TODO!!!
-        # number of fragments
+        if isinstance(mzml_paths, list) and len(mzml_paths) > 1:
+            # For multiple files, create a combined name
+            base_name = Path(mzml_paths[0].stem).stem  # Remove potential nested extensions
+            consensus.metadata["name"] = f"combined_{base_name}_mz{precursor_mz:.4f}"
+            # Add list of source files
+            consensus.metadata["source_files"] = [p.name for p in mzml_paths]
+        else:
+            # Single file case
+            mzml_path = mzml_paths[0] if isinstance(mzml_paths, list) else mzml_paths
+            consensus.metadata["name"] = f"{mzml_path.stem}_mz{precursor_mz:.4f}"
+        
+        # Number of fragments
         consensus.metadata["num_fragments"] = len(consensus.peaks.mz)
-        out_list = [consensus]
+    
+    return consensus
 
-    save_as_mgf(out_list, str(output_path))
-    logging.info("Saved %d spectrum%s ➜ %s",
-                 len(out_list), "" if len(out_list)==1 else "s", output_path)
+def extract_and_filter_spectra(mzml_paths: List[Path], cfg: dict, target_mz=None, expected_charge=None, all_precursors=False):
+    """
+    Extract and filter MS2 spectra from one or more mzML files.
+    
+    Returns a dictionary mapping precursor m/z to lists of filtered spectra.
+    """
+    processor = build_processor(cfg.get("filters", []))
+    
+    if all_precursors:
+        file_desc = f"{len(mzml_paths)} file{'s' if len(mzml_paths) > 1 else ''}"
+        logging.info(f"Extracting all precursors from {file_desc}")
+    else:
+        target_mz = cfg["precursor_mz"] if target_mz is None else target_mz
+        mz_tol_ppm = cfg["mz_tol_ppm"]
+        rt_window = cfg["rt_window"]
+        logging.info("Precursor %.6f ± %.1f ppm | RT %.1f-%.1f s from %d file%s", 
+                    target_mz, mz_tol_ppm, rt_window[0], rt_window[1],
+                    len(mzml_paths), "s" if len(mzml_paths) > 1 else "")
+    
+    # Extract and filter MS2 spectra from all mzML files
+    spectra_by_precursor = extract_ms2_spectra_from_multiple_mzml(
+        mzml_paths,
+        processor,
+        None if all_precursors else target_mz,
+        None if all_precursors else cfg["mz_tol_ppm"],
+        None if all_precursors else cfg["rt_window"],
+        expected_charge
+    )
+    
+    if not spectra_by_precursor:
+        logging.warning("No matching spectra found in input files")
+    
+    return spectra_by_precursor
 
+def merge_and_consolidate_spectra(spectra_by_precursor: Dict[float, List[Spectrum]], cfg: dict, mzml_paths: List[Path], target_mz=None, all_precursors=False):
+    """
+    Merge and consolidate spectra for each precursor.
+    
+    Returns a list of consensus spectra.
+    """
+    if not spectra_by_precursor:
+        return []
+        
+    output_spectra = []
+    
+    if all_precursors:
+        # Process all precursors found
+        for prec_mz, spectra in spectra_by_precursor.items():
+            consensus = process_precursor_spectra(spectra, prec_mz, cfg, mzml_paths)
+            if consensus is not None:
+                output_spectra.append(consensus)
+    else:
+        # Process just the target precursor
+        target_key = round(target_mz, 4)
+        if target_key not in spectra_by_precursor:
+            logging.warning("No spectra found for precursor m/z %.6f", target_mz)
+            return []
+            
+        consensus = process_precursor_spectra(spectra_by_precursor[target_key], target_mz, cfg, mzml_paths)
+        if consensus is not None:
+            output_spectra.append(consensus)
+    
+    return output_spectra
 
 def parse_args():
     p = argparse.ArgumentParser(description="Extract + clean MS² scans for a precursor.")
-    p.add_argument("--mzml", required=True, type=Path, help="Input mzML file")
+    p.add_argument("--mzml", required=True, type=Path, nargs='+', help="Input mzML file(s)")
     p.add_argument("--config", required=True, type=Path, help="YAML config")
     p.add_argument("--output", required=True, type=Path, help="Output MGF path")
     p.add_argument("--precursor_mz", type=float, help="Override precursor_mz")
     p.add_argument("--mz_tol_ppm", type=float, help="Override m/z tolerance (ppm)")
     p.add_argument("--rt_window", nargs=2, type=float, metavar=("START", "END"), help="RT window in seconds")
     p.add_argument("--charge", type=int, help="Expected precursor charge state")
+    p.add_argument("--all_precursors", action="store_true", help="Extract all precursors instead of the one specified")
     p.add_argument("--loglevel", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    p.add_argument(
-        "--export_mode",
-        choices=["individual", "consensus", "both"],
-        default="consensus",
-        help="What to write to the output MGF"
-    )
     return p.parse_args()
 
 
@@ -442,13 +557,35 @@ def main():
         cfg["rt_window"] = list(args.rt_window)
     if args.charge is not None:
         cfg["charge"] = args.charge
-    if args.export_mode:
-        cfg["export_mode"] = args.export_mode
 
     # Auto-append .mgf extension if missing
     output_path = args.output if args.output.suffix else args.output.with_suffix(".mgf")
     
-    extract_and_clean(args.mzml, cfg.get("charge"), cfg, output_path)
+    # Step 1: Extract and filter spectra from mzML files
+    filtered_spectra = extract_and_filter_spectra(
+        args.mzml,
+        cfg,
+        args.precursor_mz,
+        args.charge,
+        args.all_precursors
+    )
+    
+    # Step 2: Merge and consolidate spectra by precursor
+    consensus_spectra = merge_and_consolidate_spectra(
+        filtered_spectra,
+        cfg,
+        args.mzml,
+        args.precursor_mz,
+        args.all_precursors
+    )
+    
+    # Step 3: Save output
+    if consensus_spectra:
+        save_as_mgf(consensus_spectra, str(output_path))
+        logging.info("Saved %d spectrum%s ➜ %s",
+                    len(consensus_spectra), "" if len(consensus_spectra)==1 else "s", output_path)
+    else:
+        logging.warning("No spectra to save")
 
 
 if __name__ == "__main__":
